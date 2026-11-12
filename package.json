@@ -1,0 +1,15 @@
+{
+  "name": "r8-road-drive",
+  "version": "1.0.0",
+  "private": true,
+  "description": "R8 Road Drive - Three.js driving game packaged as an Android app with Capacitor",
+  "scripts": {
+    "prepare:web": "node scripts/prepare-web.mjs"
+  },
+  "dependencies": {
+    "@capacitor/android": "6.2.0",
+    "@capacitor/cli": "6.2.0",
+    "@capacitor/core": "6.2.0",
+    "three": "0.160.0"
+  }
+}

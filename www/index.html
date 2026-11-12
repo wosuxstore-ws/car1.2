@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#241a2b">
+<title>R8 Road Drive</title>
+<style>
+  :root{--ink:#fff4e6;--glass:rgba(36,26,43,.55)}
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;overflow:hidden;background:#241a2b;color:var(--ink);font-family:ui-sans-serif,system-ui,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;-webkit-user-select:none;user-select:none;touch-action:none;-webkit-tap-highlight-color:transparent;overscroll-behavior:none}
+  canvas{display:block}
+  #hud{position:fixed;left:max(18px,env(safe-area-inset-left));bottom:max(18px,env(safe-area-inset-bottom));pointer-events:none}
+  #speed{font-size:clamp(56px,10vw,104px);font-weight:700;line-height:.9;letter-spacing:-.03em;font-variant-numeric:tabular-nums;text-shadow:0 2px 18px rgba(0,0,0,.45)}
+  #unit{font-size:14px;opacity:.8;margin-top:6px}
+  #hint{position:fixed;top:max(14px,env(safe-area-inset-top));right:16px;max-width:260px;text-align:right;font-size:13px;line-height:1.45;opacity:.9;text-shadow:0 1px 8px rgba(0,0,0,.55);pointer-events:none}
+  #paint{position:fixed;top:max(14px,env(safe-area-inset-top));left:16px;display:flex;gap:10px}
+  #paint button{width:28px;height:28px;padding:0;border-radius:50%;border:2px solid rgba(255,255,255,.6);cursor:pointer}
+  #paint button:focus-visible{outline:2px solid #fff;outline-offset:3px}
+  #load{position:fixed;inset:0;z-index:5;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:24px;text-align:center;background:#241a2b;transition:opacity .6s}
+  #bar{width:min(320px,70vw);height:4px;border-radius:2px;overflow:hidden;background:rgba(255,255,255,.18)}
+  #bar i{display:block;width:0;height:100%;background:#ffb36b}
+  #pad{display:none}
+  @media (pointer:coarse){
+    #hint{display:none}
+    #hud{left:50%;transform:translateX(-50%);text-align:center}
+    #pad{display:block}
+    #pad button{position:fixed;bottom:max(18px,env(safe-area-inset-bottom));width:74px;height:74px;border:0;border-radius:50%;background:var(--glass);color:var(--ink);font-size:26px;touch-action:none}
+    #bL{left:14px}#bR{left:98px}#bD{right:14px}
+    #pad #bReset{bottom:auto;top:max(14px,env(safe-area-inset-top));right:16px;width:46px;height:46px;font-size:20px}
+    #pad #bU{right:14px;bottom:calc(max(18px,env(safe-area-inset-bottom)) + 88px)}
+  }
+</style>
+<script type="importmap">
+{"imports":{"three":"./lib/three/build/three.module.js","three/addons/":"./lib/three/examples/jsm/"}}
+</script>
+</head>
+<body>
+<div id="paint"></div>
+<div id="hint">Arrow keys or W A S D to drive.<br>Space brakes. R puts the car back on the road.</div>
+<div id="hud"><div id="speed">0</div><div id="unit">km/h</div></div>
+<div id="pad"><button id="bL">◀</button><button id="bR">▶</button><button id="bU">▲</button><button id="bD">▼</button><button id="bReset" aria-label="Put the car back on the road">↺</button></div>
+<div id="load"><div id="msg">Loading the R8…</div><div id="bar"><i></i></div></div>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+const MODEL = 'r8.glb';            // must sit in the same folder as this page
+const $ = id => document.getElementById(id);
+const say = t => { const m = $('msg'); if (m) m.textContent = t; };
+const fail = e => { console.error(e); const b = $('bar'); if (b) b.remove(); say('Something went wrong: ' + ((e && e.message) || e)); };
+addEventListener('error', e => fail(e.error || e.message));
+addEventListener('unhandledrejection', e => fail(e.reason));
+
+/* ---------- renderer, camera, light ---------- */
+const renderer = new THREE.WebGLRenderer({ antialias: true, stencil: false, powerPreference: 'high-performance' });
+/* Adaptive resolution: starts at the original quality (pixel ratio up to 2) and only steps down while the phone can't hold ~50 fps. */
+const DPR_MAX = Math.min(devicePixelRatio || 1, 2);
+const DPR_STEPS = [];
+for (let r = DPR_MAX; r >= Math.min(DPR_MAX, 1) - 1e-6; r -= .25) DPR_STEPS.push(r);
+let dprLvl = 0, perfT0 = 0;                   // perfT0 is set once the game is on screen
+renderer.setPixelRatio(DPR_STEPS[0]);
+const ANISO = Math.min(renderer.capabilities.getMaxAnisotropy(), 8);
+renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+document.body.prepend(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.fog = new THREE.Fog(0xe7bf9c, 90, 480);
+scene.environment = new THREE.PMREMGenerator(renderer).fromScene(new RoomEnvironment(), 0.04).texture;
+const cam = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.5, 2000);
+scene.add(new THREE.HemisphereLight(0xcfe0ff, 0x4a3a2c, 0.9));
+const sun = new THREE.DirectionalLight(0xffd2a1, 2.4);
+sun.position.set(-60, 38, 50);
+scene.add(sun);
+
+/* ---------- procedural textures ---------- */
+function tex(w, h, draw, rep) {
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  draw(c.getContext('2d'), w, h);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  if (rep) { t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(rep[0], rep[1]); t.anisotropy = ANISO; }
+  return t;
+}
+
+/* ---------- world: sky, ground, road, trees, posts ---------- */
+const sky = new THREE.Mesh(
+  new THREE.SphereGeometry(900, 24, 16),
+  new THREE.MeshBasicMaterial({
+    map: tex(2, 256, (g, w, h) => {
+      const gr = g.createLinearGradient(0, 0, 0, h);
+      gr.addColorStop(0, '#4b68a8'); gr.addColorStop(.42, '#f0b98c'); gr.addColorStop(.5, '#e7bf9c'); gr.addColorStop(1, '#e7bf9c');
+      g.fillStyle = gr; g.fillRect(0, 0, w, h);
+    }),
+    side: THREE.BackSide, fog: false, depthWrite: false, toneMapped: false
+  })
+);
+scene.add(sky);
+
+const ground = new THREE.Mesh(
+  new THREE.PlaneGeometry(2400, 2400),
+  new THREE.MeshLambertMaterial({ map: tex(64, 64, (g, w, h) => {
+    g.fillStyle = '#566f38'; g.fillRect(0, 0, w, h);
+    for (let i = 0; i < 500; i++) { const r = Math.random(); g.fillStyle = `rgb(${70 + r * 40 | 0},${96 + r * 50 | 0},${48 + r * 24 | 0})`; g.fillRect(Math.random() * w, Math.random() * h, 2, 2); }
+  }, [300, 300]) })
+);
+ground.rotation.x = -Math.PI / 2;
+scene.add(ground);
+
+const road = new THREE.Mesh(
+  new THREE.PlaneGeometry(12, 1200),
+  new THREE.MeshLambertMaterial({ map: tex(128, 256, (g, w, h) => {
+    g.fillStyle = '#34343a'; g.fillRect(0, 0, w, h);
+    for (let i = 0; i < 1800; i++) { const v = 40 + Math.random() * 30 | 0; g.fillStyle = `rgb(${v},${v},${v + 4})`; g.fillRect(Math.random() * w, Math.random() * h, 2, 2); }
+    g.fillStyle = '#ece6d6';
+    g.fillRect(4, 0, 3, h); g.fillRect(w - 7, 0, 3, h);                         // edge lines
+    g.fillRect(w / 2 - 1.5, 0, 3, 43); g.fillRect(w / 2 - 1.5, 128, 3, 43);       // dashed centre line
+  }, [1, 50]) })
+);
+road.rotation.x = -Math.PI / 2;
+road.position.y = 0.04;
+scene.add(road);
+
+const rnd = i => { const s = Math.sin(i * 127.1 + 311.7) * 43758.5453; return s - Math.floor(s); };
+const _m = new THREE.Matrix4(), _q = new THREE.Quaternion(), _p = new THREE.Vector3(), _s = new THREE.Vector3();
+const _qy = new THREE.Quaternion(), _up = new THREE.Vector3(0, 1, 0);
+
+/* guard posts along the road edge (recycled like the trees) */
+const posts = new THREE.InstancedMesh(new THREE.BoxGeometry(.12, .9, .12), new THREE.MeshLambertMaterial({ color: 0xf4efe6 }), 120);
+posts.frustumCulled = false;
+scene.add(posts);
+
+/* ---------- trees: the 12 trees from trees.glb (3 species x 4 variants), instanced ---------- */
+const TREES = 'trees.glb';                   // must sit in the same folder as this page, next to r8.glb
+const N = 240, S = 7;                        // tree slots and spacing along the road (m); they loop every N*S = 1680 m
+const LOOP = N * S;
+const slots = [];
+for (let i = 0; i < N; i++) {
+  const near = rnd(i + 31) < .45;            // some trees line the road edge, the rest form a deeper forest behind them
+  const stretch = rnd((i >> 4) + 500) * 3 | 0;                         // each ~110 m stretch favours one species...
+  const species = rnd(i + 800) < .25 ? rnd(i + 900) * 3 | 0 : stretch; // ...with a few strays mixed in
+  slots.push({
+    x: (i % 2 ? 1 : -1) * (near ? 11.5 + rnd(i) * 5 : 16 + rnd(i) * 32),
+    z0: i * S + (rnd(i + 57) - .5) * 5,      // base position along the road, with a little jitter
+    s: .85 + rnd(i + 99) * .4,
+    yaw: rnd(i + 13) * Math.PI * 2,
+    v: species * 4 + (rnd(i + 5) * 4 | 0),   // which of the 12 tree models
+    z: NaN, k: 0
+  });
+}
+
+for (const o of slots) o.q = new THREE.Quaternion().setFromAxisAngle(_up, o.yaw);
+
+let trees = null;                            // { update(z) } once the trees are ready
+
+function buildTrees(gltf) {
+  const aniso = Math.min(ANISO, 4);   // leaf cards: 4x is visually the same, much cheaper on phones
+  const models = gltf.scene.children.map(n => { const parts = []; n.traverse(o => { if (o.isMesh) parts.push(o); }); return { parts, inst: [] }; });
+
+  // The kit ships its leaf cards as alpha-BLEND, which flickers on instanced meshes (instances can't be depth-sorted).
+  // Alpha-test + alpha-to-coverage gives crisp, anti-aliased leaves with correct depth ordering instead.
+  for (const mat of new Set(models.flatMap(m => m.parts.map(p => p.material)))) {
+    if (mat.map) mat.map.anisotropy = aniso;
+    mat.roughness = Math.max(mat.roughness, .8);               // foliage and bark are matte, no plastic sun glare
+    if (mat.transparent) { mat.transparent = false; mat.alphaTest = .4; mat.alphaToCoverage = true; mat.depthWrite = true; }
+    mat.side = THREE.DoubleSide;
+    mat.needsUpdate = true;
+  }
+
+  const count = models.map(() => 0);
+  for (const o of slots) { o.v %= models.length; o.k = count[o.v]++; }
+  models.forEach((m, vi) => {
+    if (!count[vi]) return;
+    m.inst = m.parts.map(p => { const im = new THREE.InstancedMesh(p.geometry, p.material, count[vi]); im.frustumCulled = false; scene.add(im); return im; });
+  });
+
+  // soft contact shadow under every tree
+  const blob = new THREE.InstancedMesh(
+    new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2),
+    new THREE.MeshBasicMaterial({
+      map: tex(128, 128, (g, w, h) => {
+        const r = g.createRadialGradient(w / 2, h / 2, 4, w / 2, h / 2, w / 2);
+        r.addColorStop(0, 'rgba(0,0,0,.7)'); r.addColorStop(.55, 'rgba(0,0,0,.35)'); r.addColorStop(1, 'rgba(0,0,0,0)');
+        g.fillStyle = r; g.fillRect(0, 0, w, h);
+      }),
+      transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1
+    }), N);
+  blob.frustumCulled = false;
+  scene.add(blob);
+
+  try { for (const mat of new Set(models.flatMap(m => m.parts.map(p => p.material)))) if (mat.map) renderer.initTexture(mat.map); } catch (e) { console.warn(e); }   // upload textures now, not mid-drive
+
+  const q0 = new THREE.Quaternion();
+  const FOG_FAR = 500, PAD = 10;               // beyond the fog distance a tree is fully fogged; PAD covers tree size (max ~5 m wide, ~11 m tall)
+  const nVis = models.map(() => 0);
+  trees = {
+    update(z) {                              // recycle trees so the forest feels endless, and draw only the visible ones
+      const fx = Math.sin(st.ch), fz = Math.cos(st.ch);
+      const cx = cam.position.x, cz = cam.position.z;
+      const tanH = Math.tan(cam.fov * Math.PI / 360) * cam.aspect * 1.1;
+      nVis.fill(0);
+      let bi = 0;
+      for (let i = 0; i < N; i++) {
+        const o = slots[i], zi = o.z0 + Math.round((z - o.z0) / LOOP) * LOOP;
+        const dx = o.x - cx, dz = zi - cz;
+        const f = dx * fx + dz * fz;
+        if (f < -PAD || f > FOG_FAR) continue;
+        if (Math.abs(dx * fz - dz * fx) > (f + PAD) * tanH + PAD) continue;
+        _m.compose(_p.set(o.x, 0, zi), o.q, _s.setScalar(o.s));
+        const mv = models[o.v], k = nVis[o.v]++;
+        for (const im of mv.inst) im.setMatrixAt(k, _m);
+        blob.setMatrixAt(bi++, _m.compose(_p.set(o.x + 1.4 * o.s, .08, zi - 1.1 * o.s), q0, _s.set(7 * o.s, 1, 7 * o.s)));
+      }
+      models.forEach((m, vi) => {
+        for (const im of m.inst) { im.count = nVis[vi]; im.visible = nVis[vi] > 0; im.instanceMatrix.needsUpdate = true; }
+      });
+      blob.count = bi; blob.visible = bi > 0;
+      blob.instanceMatrix.needsUpdate = true;
+    }
+  };
+  trees.update(st.z);
+}
+
+function buildFallbackTrees() {              // only used if trees.glb can't be loaded
+  const trunk = new THREE.InstancedMesh(new THREE.CylinderGeometry(.22, .3, 1.8, 6), new THREE.MeshLambertMaterial({ color: 0x4a3626 }), N);
+  const crown = new THREE.InstancedMesh(new THREE.ConeGeometry(1.7, 5.2, 7), new THREE.MeshLambertMaterial({ color: 0xffffff }), N);
+  for (let i = 0; i < N; i++) crown.setColorAt(i, new THREE.Color().setHSL(.27 + rnd(i + 7) * .08, .38, .16 + rnd(i + 3) * .1));
+  for (const m of [trunk, crown]) { m.frustumCulled = false; scene.add(m); }
+  trees = {
+    update(z) {
+      for (let i = 0; i < N; i++) {
+        const o = slots[i], zi = o.z0 + Math.round((z - o.z0) / LOOP) * LOOP;
+        _s.setScalar(o.s);
+        trunk.setMatrixAt(i, _m.compose(_p.set(o.x, .9 * o.s, zi), _q, _s));
+        crown.setMatrixAt(i, _m.compose(_p.set(o.x, 4 * o.s, zi), _q, _s));
+      }
+      trunk.instanceMatrix.needsUpdate = crown.instanceMatrix.needsUpdate = true;
+    }
+  };
+}
+
+let postKey = NaN;
+function place(z) {                          // recycle trees and posts so the road feels endless
+  if (trees) trees.update(z);
+  const pk = Math.floor(z / 10);
+  if (pk === postKey) return;
+  postKey = pk;
+  _s.setScalar(1);
+  for (let i = 0; i < 120; i++) {
+    const j = i >> 1, zi = j * 20 + Math.round((z - j * 20) / 1200) * 1200;
+    posts.setMatrixAt(i, _m.compose(_p.set(i & 1 ? 6.9 : -6.9, .45, zi), _q, _s));
+  }
+  posts.instanceMatrix.needsUpdate = true;
+}
+
+/* ---------- the car ---------- */
+const car = new THREE.Group();
+car.rotation.order = 'YXZ';
+scene.add(car);
+const shadow = new THREE.Mesh(
+  new THREE.PlaneGeometry(2.8, 5.8),
+  new THREE.MeshBasicMaterial({ map: tex(128, 128, (g, w, h) => {
+    const r = g.createRadialGradient(w / 2, h / 2, 6, w / 2, h / 2, w / 2);
+    r.addColorStop(0, 'rgba(0,0,0,.75)'); r.addColorStop(1, 'rgba(0,0,0,0)');
+    g.fillStyle = r; g.fillRect(0, 0, w, h);
+  }), transparent: true, depthWrite: false })
+);
+shadow.rotation.x = -Math.PI / 2; shadow.position.y = .09;
+car.add(shadow);
+
+const body = [], tails = [], wheels = [], mats = new Map();
+function skin(src) {                         // the GLB's materials are plain white, so rebuild them from their names
+  const n = src.name.toLowerCase();
+  if (mats.has(n)) return mats.get(n);
+  const P = o => new THREE.MeshPhysicalMaterial(o);
+  let m;
+  if (n.includes('glass')) m = P({ color: 0x10151c, roughness: .05, metalness: .1, transparent: true, opacity: .42, depthWrite: false });
+  else if (n.includes('tire')) m = P({ color: 0x0e0e0f, roughness: .85 });
+  else if (n.includes('emissive warm')) { m = P({ color: 0x3a0505, emissive: 0xff1c0a, emissiveIntensity: .8 }); tails.push(m); }
+  else if (n.includes('emissive cool')) m = P({ color: 0xffffff, emissive: 0xeaf2ff, emissiveIntensity: 2 });
+  else if (n === 'paint metallic cool grey #1') { m = P({ color: 0x8b9099, metalness: .75, roughness: .28, clearcoat: 1, clearcoatRoughness: .06 }); body.push(m); }
+  else if (n.includes('orange peel')) m = P({ color: 0x9ea3aa, metalness: 1, roughness: .28 });
+  else if (n.includes('red')) m = P({ color: 0xc8161d, roughness: .4 });
+  else if (/black|carbon|soft rough|interior/.test(n)) m = P({ color: 0x0d0d10, metalness: .2, roughness: .45 });
+  else if (n.includes('cloth')) m = P({ color: 0xc9b89b, roughness: .9 });
+  else m = P({ color: 0xc4c8cc, metalness: 1, roughness: .35 });
+  mats.set(n, m);
+  return m;
+}
+
+async function onModel(gltf) {
+  say('Building the car…');
+  const model = gltf.scene;                  // the GLB is already in metres, with the wheels split out as wheel_0 ... wheel_3
+  model.traverse(o => { if (o.isMesh) o.material = Array.isArray(o.material) ? o.material.map(skin) : skin(o.material); });
+
+  // wheel_0 / wheel_1 are the front pair, wheel_2 / wheel_3 the rear. Each node's origin is its axle centre, so it can spin and steer as it is.
+  for (let i = 0; i < 4; i++) {
+    const g = model.getObjectByName('wheel_' + i);
+    if (!g) continue;
+    g.rotation.order = 'YXZ';
+    wheels.push({ g, front: g.position.z > 0 });
+  }
+  car.add(model);
+
+  const COLORS = [0x8b9099, 0xc8161d, 0x1f4fb8, 0xe9e6df, 0xf0b400];
+  COLORS.forEach(hex => {
+    const b = document.createElement('button');
+    b.style.background = '#' + hex.toString(16).padStart(6, '0');
+    b.setAttribute('aria-label', 'Paint color');
+    b.onclick = () => body.forEach(m => m.color.setHex(hex));
+    $('paint').append(b);
+  });
+  reset();
+  await treesReady;
+  say('Preparing graphics…');
+  await new Promise(r => setTimeout(r, 50));   // let the message paint before the heavy shader work
+  try { await Promise.race([renderer.compileAsync(scene, cam), new Promise(r => setTimeout(r, 8000))]); } catch (e) { console.warn(e); }
+  $('load').style.opacity = 0;
+  perfT0 = performance.now();
+  setTimeout(() => $('load').remove(), 700);
+}
+
+const dl = { car: [0, 1.81e6], trees: [0, 5.33e6] };      // bytes loaded / expected, so one bar covers both downloads
+function progress(k, e) {
+  dl[k] = [e.loaded, e.total || dl[k][1]];
+  const pct = Math.min(100, 100 * (dl.car[0] + dl.trees[0]) / (dl.car[1] + dl.trees[1]));
+  const b = $('bar'); if (b) b.firstElementChild.style.width = pct + '%';
+  say('Downloading models… ' + Math.round(pct) + '%');
+}
+const treesReady = new GLTFLoader().loadAsync(TREES, e => progress('trees', e)).then(buildTrees)
+  .catch(err => { console.warn('Could not load ' + TREES + ', using simple trees instead.', err); buildFallbackTrees(); });
+
+new GLTFLoader().load(
+  MODEL, onModel,
+  e => progress('car', e),
+  err => { console.error(err); const b = $('bar'); if (b) b.remove(); say('Could not load r8.glb (' + ((err && err.message) || 'unknown error') + '). Check that r8.glb is in the same folder as this page.'); }
+);
+
+/* ---------- controls ---------- */
+const keys = {};
+const KEYMAP = { ArrowUp: 'u', KeyW: 'u', ArrowDown: 'd', KeyS: 'd', ArrowLeft: 'l', KeyA: 'l', ArrowRight: 'r', KeyD: 'r', Space: 'b' };
+addEventListener('keydown', e => { if (KEYMAP[e.code]) { keys[KEYMAP[e.code]] = 1; e.preventDefault(); } if (e.code === 'KeyR') reset(); });
+addEventListener('keyup', e => { if (KEYMAP[e.code]) keys[KEYMAP[e.code]] = 0; });
+[['bU', 'u'], ['bD', 'd'], ['bL', 'l'], ['bR', 'r']].forEach(([id, k]) => {
+  const el = $(id);
+  el.onpointerdown = e => { keys[k] = 1; el.setPointerCapture(e.pointerId); };
+  el.onpointerup = el.onpointercancel = () => { keys[k] = 0; };
+});
+$('bReset').onclick = () => reset();
+$('pad').addEventListener('contextmenu', e => e.preventDefault());
+
+/* ---------- driving model ---------- */
+const st = { x: -3, z: 0, h: 0, v: 0, steer: 0, ch: 0, pitch: 0, roll: 0, t: 0 };
+const L = 2.65, R = .313, VMAX = 75;         // wheelbase, wheel radius, top speed (m/s)
+function reset() { Object.assign(st, { x: -3, z: 0, h: 0, v: 0, steer: 0, ch: 0 }); }
+
+function step(dt) {
+  const off = Math.abs(st.x) > 6.4;          // on the grass
+  let a;
+  if (keys.u) a = st.v < 0 ? 26 : 12 * (1 - st.v / VMAX);
+  else if (keys.d) a = st.v > .5 ? -26 : -6 * Math.max(0, 1 + st.v / 10);
+  else a = -Math.sign(st.v) * (1.8 + .0008 * st.v * st.v);
+  if (keys.b) a -= Math.sign(st.v) * 28;
+  if (off) a -= st.v * .5;
+  const v0 = st.v;
+  st.v += a * dt;
+  if ((!keys.u && !keys.d || keys.b) && v0 * st.v <= 0) st.v = 0;
+
+  st.steer += (((keys.l ? 1 : 0) - (keys.r ? 1 : 0)) - st.steer) * Math.min(1, 9 * dt);
+  const lim = 14 / Math.max(Math.abs(st.v), 1);                         // grip limit: gentler turning at speed
+  const yaw = Math.max(-lim, Math.min(lim, st.v / L * Math.tan(st.steer * .55)));
+  st.h += yaw * dt;
+  st.x += Math.sin(st.h) * st.v * dt;
+  st.z += Math.cos(st.h) * st.v * dt;
+
+  const k = Math.min(1, 6 * dt);
+  st.pitch += (-a * .0035 - st.pitch) * k;
+  st.roll += (Math.max(-.07, Math.min(.07, st.v * yaw * .004)) - st.roll) * k;
+  car.position.set(st.x, off ? Math.sin(st.t * 70) * .012 * Math.min(1, Math.abs(st.v) / 15) : 0, st.z);
+  car.rotation.set(st.pitch, st.h, st.roll);
+
+  const spin = st.v * dt / R, sa = st.steer * .5 / (1 + Math.abs(st.v) * .05);
+  for (const w of wheels) { w.g.rotation.x = (w.g.rotation.x + spin) % 6.2832; w.g.rotation.y = w.front ? sa : 0; }
+  const braking = keys.b || (keys.d && st.v > .5);
+  tails.forEach(m => { m.emissiveIntensity = braking ? 3.2 : .8; });
+
+  // chase camera that swings around behind the car with a little lag
+  const dh = ((st.h - st.ch + Math.PI) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI) - Math.PI;
+  st.ch += dh * Math.min(1, 4 * dt);
+  const sp = Math.min(Math.abs(st.v), 75), d = 7 + sp * .06;
+  cam.position.set(st.x - Math.sin(st.ch) * d, 2.6 + sp * .008, st.z - Math.cos(st.ch) * d);
+  cam.lookAt(st.x + Math.sin(st.ch) * 3, 1.1, st.z + Math.cos(st.ch) * 3);
+  cam.fov = 58 + sp * .22;
+  cam.updateProjectionMatrix();
+
+  road.position.z = Math.round(st.z / 24) * 24;
+  ground.position.set(Math.round(st.x / 8) * 8, 0, Math.round(st.z / 8) * 8);
+  sky.position.copy(cam.position);
+  place(st.z);
+}
+
+let last = performance.now(), shown = -1, hudAt = 0;
+let ema = 16.7, nextEval = 0, nextUp = 0, upWait = 8000, probedAt = 0;
+function setLevel(l) { dprLvl = l; renderer.setPixelRatio(DPR_STEPS[l]); }
+renderer.setAnimationLoop(now => {
+  const raw = now - last;
+  const dt = Math.min(raw / 1000, .05);
+  last = now; st.t += dt;
+
+  if (DPR_STEPS.length > 1 && perfT0 && raw < 250) {      // raw >= 250 ms means the app was paused, not slow
+    ema += (Math.min(raw, 50) - ema) * .08;
+    if (now > perfT0 + 3000 && now > nextEval) {
+      nextEval = now + 1000;
+      if (ema > 21 && dprLvl < DPR_STEPS.length - 1) {    // under ~48 fps: draw fewer pixels
+        if (probedAt && now - probedAt < 6000) upWait = Math.min(upWait * 2, 90000);   // the last step up did not hold
+        probedAt = 0; setLevel(dprLvl + 1); nextEval = now + 1500; nextUp = now + upWait; ema = 16.7;
+      } else if (ema < 18.5 && dprLvl > 0 && now > nextUp) {   // there is headroom: try a sharper image again
+        setLevel(dprLvl - 1); probedAt = now; nextEval = now + 1500; nextUp = now + upWait; ema = 16.7;
+      }
+    }
+  }
+
+  step(dt);
+  const kmh = Math.round(Math.abs(st.v) * 3.6);
+  if (kmh !== shown && now - hudAt > 90) { $('speed').textContent = kmh; shown = kmh; hudAt = now; }
+  renderer.render(scene, cam);
+});
+
+addEventListener('resize', () => {
+  renderer.setSize(innerWidth, innerHeight);
+  cam.aspect = innerWidth / innerHeight;
+  cam.updateProjectionMatrix();
+});
+</script>
+</body>
+</html>

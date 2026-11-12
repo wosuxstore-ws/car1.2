@@ -1,0 +1,14 @@
+{
+  "appId": "com.r8.roaddrive",
+  "appName": "R8 Road Drive",
+  "webDir": "www",
+  "backgroundColor": "#241a2b",
+  "server": {
+    "androidScheme": "https"
+  },
+  "android": {
+    "allowMixedContent": false,
+    "webContentsDebuggingEnabled": false
+  },
+  "loggingBehavior": "none"
+}
